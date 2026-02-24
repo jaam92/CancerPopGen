@@ -128,7 +128,7 @@ for (chr in chromosomes) {
       bed_file <- file.path(cancer_clean, paste0(pop, "_", cancer_clean, "_chr", chr, "_null_matched_bvals_ldsc.bed"))
       
       write_tsv(matched_subset, matched_file)
-      write_tsv(matched_bed, bed_file)
+      write_tsv(matched_bed, bed_file, col_names = FALSE)
     }
     
     message("    Files written for population ", pop, " chromosome ", chr)
