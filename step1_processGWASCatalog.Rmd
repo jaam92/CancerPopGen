@@ -1,0 +1,218 @@
+---
+title: "Process GWAS Catalog Variants and output rsIDs"
+---
+
+################################################################################################
+
+### STEP 1: Putting all of our files into a single data frame
+################################################################################################
+
+```{r}
+library(tidyverse)
+library(data.table)
+
+#Grab input files
+setwd("~/Downloads/cancerproject/") #Update this to the directory with all your files
+fnames = list.files(pattern = "^gwas-association-downloaded_.*\\.tsv$")
+
+#Generate data frame with all our data and add a column with fileName
+gwas = rbindlist(sapply(fnames, read.delim, simplify = FALSE), use.names = TRUE, idcol = "FileName") %>%
+  mutate(
+    cancer_type = FileName %>%
+      str_remove("^.*withChildTraits_") %>%
+      str_remove("\\.tsv$")
+  )
+colnames(gwas)
+```
+
+1. Initial number of SNPs
+```{r}
+dim(gwas)[1] 
+```
+
+2. Initial number of studies
+```{r}
+length(unique(gwas$PUBMEDID))
+```
+
+3. Initial number of subtypes
+```{r}
+unique(gwas$DISEASE.TRAIT)
+
+```
+
+4. Initial races and/or ethnicities in project
+
+Next step for this will be you guys figuring out how to pull ancestry and 
+ethnicity from the INITIAL.SAMPLE.SIZE column
+
+```{r}
+summarise_studies = gwas %>%
+  group_by(PUBMEDID, MAPPED_TRAIT) %>% #group by the study and trait
+  count(INITIAL.SAMPLE.SIZE, name = "n_associations") #output sample composition and the number of observations which is the number of associations
+```
+################################################################################################
+
+### STEP 2: Clean up data and count up the associated variants per chromosome
+
+################################################################################################
+
+```{r}
+
+#Clean up the messy data
+gwas_checked <- gwas %>%
+  mutate(
+    # Remove allele-annotated rsIDs from SNPS column
+    SNPS_clean = str_remove_all(SNPS, "rs[0-9]+-[A-Za-z]+"),
+    
+    # Remove plain rsIDs (not followed by -) from strongest risk allele column
+    `STRONGEST.SNP.RISK.ALLELE` =
+      str_remove_all(`STRONGEST.SNP.RISK.ALLELE`,
+                     "\\brs[0-9]+\\b(?!-)"),
+    
+    # Clean up extra delimiters that may result
+    `STRONGEST.SNP.RISK.ALLELE` =
+      str_replace_all(`STRONGEST.SNP.RISK.ALLELE`, ";\\s*;", ";"),
+    
+    `STRONGEST.SNP.RISK.ALLELE` =
+      str_replace_all(`STRONGEST.SNP.RISK.ALLELE`, "^;\\s*|;\\s*$", "")
+  ) %>%
+  mutate(
+    n_rsids = str_count(SNPS_clean, "rs[0-9]+"),
+    n_pos   = str_count(CHR_POS, "[0-9]+")
+  ) %>%
+  filter(n_rsids == n_pos)
+
+###remove SNPs without known rsIDs, multi-allelic, and clean chromosome IDs
+gwas_clean <- gwas_checked %>%
+  separate_rows(SNPS, SNP_ID_CURRENT, `STRONGEST.SNP.RISK.ALLELE`, CHR_ID, CHR_POS, sep =  "\\s*x\\s*|;") %>%  # split on " x " or ;
+  mutate(SNPS = str_trim(SNPS)) %>%
+  filter(str_detect(SNPS, "^rs[0-9]+$")) %>% 
+  filter(!grepl("-[ACGT]{2,}$", `STRONGEST.SNP.RISK.ALLELE`)) %>%  #remove obvious multi-allelic risk SNPs
+  mutate(
+  allele = sub("^.*-", "", `STRONGEST.SNP.RISK.ALLELE`),
+  SNP_ID_CURRENT = if_else(
+    is.na(SNP_ID_CURRENT) | SNP_ID_CURRENT == "",
+    SNPS,
+    paste0("rs", SNP_ID_CURRENT)
+  ), #add rsID for those split rows or rs to current SNP ID
+  IDmatch = if_else(SNPS == SNP_ID_CURRENT, 1L, 0L), #indicator to see if IDs match
+  CHR_ID_clean = gsub("[^0-9XY]", "", CHR_ID) #only keep digits or X/Y for chromosome
+) %>%
+  filter(grepl("^[0-9]+$", CHR_ID_clean)) %>% #final filter to keep autosomal SNPs
+  mutate(CHR_ID_clean = as.integer(CHR_ID_clean)) %>% #now make it an integer 
+  select(cancer_type, PUBMEDID, INITIAL.SAMPLE.SIZE, DISEASE.TRAIT, MAPPED_TRAIT, MAPPED_GENE, CHR_ID_clean, SNPS, SNP_ID_CURRENT, allele) %>%
+  distinct() %>% #remove duplicate rows 
+  arrange(-desc(CHR_ID_clean)) #sort chromosomes from 1-22
+
+#write out the processed files with all info and rsIDs
+write.table(
+    gwas_clean,
+    file = "processed_gwas-associations.tsv", #update this with a path if you need
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE,
+    col.names = TRUE
+  )
+
+write.table(
+    gwas_clean %>% pull(SNP_ID_CURRENT) %>% unique(), #remove duplicates
+    file = "processed_gwas-associations_SNPIDCurrent_rsIDs.txt", #update this with a path if you need
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE,
+    col.names = FALSE
+)
+```
+################################################################################################
+
+### STEP 3: Pull rsIDs and save to a file split by cancer type
+
+################################################################################################
+```{r}
+# get unique chromosome + cancer_type combinations
+chr_cancer_combos <- gwas_clean %>%
+  distinct(CHR_ID_clean, cancer_type)
+
+# loop through each combination
+for (i in seq_len(nrow(chr_cancer_combos))) {
+  chr_val <- chr_cancer_combos$CHR_ID_clean[i]
+  cancer_val <- chr_cancer_combos$cancer_type[i]
+
+  # filter the dataframe
+  df_out <- gwas_clean %>%
+    filter(CHR_ID_clean == chr_val,
+           cancer_type == cancer_val) %>%
+    select(SNP_ID_CURRENT) %>%
+    distinct()   # unique rsIDs
+
+  # sanitize cancer name for file path (replace spaces with _)
+  cancer_file <- gsub(" ", "_", cancer_val)
+
+  # write output file
+  write.table(
+    df_out,
+    #file = paste0(cancer_val, "/chr", chr_val, "_", cancer_file, "_rsids.txt"), # this has a directory structure
+    file = paste0("chr", chr_val, "_", cancer_file, "_rsids.txt"), # this will output everything to current directory
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE,
+    col.names = FALSE
+  )
+}
+
+```
+################################################################################################
+
+### STEP 4: Plotting
+
+################################################################################################
+```{r}
+cancer_colors <- c(
+  "Breast cancer"      = "#27254C",  # JJK: dark indigo
+  "Colorectal cancer"  = "#564A94",  # JJK: muted purple
+  "Kidney cancer"      = "#9B8AB4",  # JJK: light purple
+  "Lung cancer"        = "#F7C83B",  # JJK: golden yellow
+  "Ovarian cancer"     = "#000000",  # JJK: black
+  "Pancreatic cancer"  = "#39BEB8",  # JJK add: teal accent
+  "Prostate cancer"    = "#C1440E"   # FMA: burnt orange (FMA‑style)
+)
+
+#count associations per chromosome
+chr_counts <- gwas_clean %>%
+  group_by(cancer_type) %>% 
+  distinct(SNP_ID_CURRENT, .keep_all = TRUE) %>% #remove duplicate rsIDs
+  count(CHR_ID_clean, name = "n_associations") %>% #num associations per chrom
+  mutate(
+    CHR_ID_clean = factor(
+      CHR_ID_clean,
+      levels = c(as.character(1:22))
+    ),
+    cancer_type = str_replace_all(cancer_type, "_", " "),
+    cancer_type = str_replace_all(cancer_type, "([a-z])([A-Z])", "\\1 \\2"),
+    cancer_type = str_to_sentence(cancer_type)
+  )
+
+#plot it
+associations_acrossCancers = ggplot(chr_counts, aes(x = cancer_type, y = n_associations, fill = cancer_type)) +
+  geom_col() +
+  facet_wrap(~ CHR_ID_clean, scales = "free_y") +
+  scale_fill_manual(values = cancer_colors) +
+  theme_bw(base_size = 16) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+    axis.title = element_text(size = 18),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 14),
+    axis.text.y = element_text(size = 14),
+    strip.text = element_text(size = 16, face = "bold"),
+    legend.position = "none"
+  ) +
+  labs(
+    x = "Cancer Type",
+    y = "Number of Associations",
+    title = "GWAS Associations per Chromosome by Cancer Type"
+  )
+
+print(associations_acrossCancers)
+
+```
